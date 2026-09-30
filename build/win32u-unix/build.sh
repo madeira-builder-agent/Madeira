@@ -148,7 +148,7 @@ ar rcs "$OBJ_DIR/libwin32u_unix.a" "$OBJ_DIR"/*.o
 
 # Merge the static freetype so the app link needs no project changes.
 if [ -f "$FREETYPE_DIR/build/libfreetype.a" ]; then
-    libtool -static -o "$OBJ_DIR/libwin32u_unix.a" \
+    xcrun libtool -static -o "$OBJ_DIR/libwin32u_unix.a" \
         "$OBJ_DIR/libwin32u_unix.a" "$FREETYPE_DIR/build/libfreetype.a" 2>/dev/null
     echo "merged libfreetype.a"
 else
