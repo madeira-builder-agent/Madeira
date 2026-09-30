@@ -42,6 +42,7 @@ compile_one() {
         -I"$NTDLL_SHIMS" \
         -I"$WINE_BUILD/dlls/win32u" -I"$WINE_SRC/dlls/win32u" \
         -I"$WINE_BUILD/include" -I"$WINE_SRC/include" \
+        -I"$WINE_SRC/include/wine/windows" \
         -D__WINESRC__ -D_WIN32U_ \
         -D_ACRTIMP= -DWINBASEAPI= \
         -DSYSTEMDLLPATH=\"\" \
