@@ -93,6 +93,12 @@ jobs:
             wine/build-macos
             build/gnutls-ios/obj
             build/freetype-ios/obj
+            build/ffmpeg/obj
+            toolchains/ffmpeg-ios
+            app/Madeira/libavformat.a
+            app/Madeira/libavcodec.a
+            app/Madeira/libswresample.a
+            app/Madeira/libavutil.a
             build/ntdll-unix/obj
             build/win32u-unix/obj
             build/wineserver/obj
@@ -649,6 +655,12 @@ jobs:
             wine/build-macos
             build/gnutls-ios/obj
             build/freetype-ios/obj
+            build/ffmpeg/obj
+            toolchains/ffmpeg-ios
+            app/Madeira/libavformat.a
+            app/Madeira/libavcodec.a
+            app/Madeira/libswresample.a
+            app/Madeira/libavutil.a
             build/ntdll-unix/obj
             build/win32u-unix/obj
             build/wineserver/obj
