@@ -200,6 +200,12 @@ jobs:
           set -euxo pipefail
           bash build/freetype-ios/build.sh
 
+      - name: Build FFmpeg
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          bash build/ffmpeg/build.sh
+
       - name: Build ntdll-unix
         if: steps.native-cache.outputs.cache-hit != 'true'
         run: |
