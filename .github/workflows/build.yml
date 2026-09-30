@@ -1,0 +1,810 @@
+name: Build Madeira IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+env:
+  BUNDLE_ID: com.NotBoodiOS.madeira
+  LLVM_MINGW_TAG: "20260421"
+  IOS_DEPLOYMENT_TARGET: "17.0"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Madeira with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "16.4"
+
+      - name: Show toolchain versions
+        run: |
+          set -euxo pipefail
+          xcodebuild -version
+          xcodebuild -showsdks
+          clang --version
+          cmake --version
+          ninja --version
+          python3 --version
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          brew install bison cmake ninja meson nasm python-setuptools libtool pkg-config
+
+      - name: Cache llvm-mingw
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchains/llvm-mingw
+          key: madeira-llvm-mingw-${{ env.LLVM_MINGW_TAG }}-macos-universal
+
+      - name: Install llvm-mingw
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          mkdir -p toolchains
+          curl -fL \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_TAG}/llvm-mingw-${LLVM_MINGW_TAG}-ucrt-macos-universal.tar.xz" \
+            -o /tmp/llvm-mingw.tar.xz
+          tar -xJf /tmp/llvm-mingw.tar.xz -C /tmp
+          rm -rf toolchains/llvm-mingw
+          mv "/tmp/llvm-mingw-${LLVM_MINGW_TAG}-ucrt-macos-universal" toolchains/llvm-mingw
+
+      - name: Add toolchains to PATH
+        run: |
+          set -euxo pipefail
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toolchains/llvm-mingw/bin" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toolchains/llvm-mingw" >> "$GITHUB_PATH"
+          echo "$HOMEBREW_PREFIX/opt/libtool/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Verify ARM64EC compiler
+        run: |
+          set -euxo pipefail
+          command -v arm64ec-w64-mingw32-clang
+          command -v arm64ec-w64-mingw32-widl
+          arm64ec-w64-mingw32-clang --version
+          arm64ec-w64-mingw32-widl --version || true
+
+      - name: Compute source/submodule cache key
+        id: source
+        run: |
+          set -euxo pipefail
+          echo "sha=$(git submodule status --recursive | shasum -a 256 | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Madeira native build products
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            FEX/build-ios
+            wine/build-arm64ec
+            wine/build-macos
+            build/gnutls-ios/obj
+            build/freetype-ios/obj
+            build/ntdll-unix/obj
+            build/win32u-unix/obj
+            build/wineserver/obj
+            build/dxmt-ios/obj
+            build/dxmt-ios/shader-headers
+            build/dxmt-ios/libdxmt_unix.a
+            build/dxmt-ios/libdxmt_combined.a
+            app/Madeira/libntdll_unix.a
+            app/Madeira/libwin32u_unix.a
+            app/Madeira/libwineserver.a
+            app/Madeira/libdxmt_combined.a
+          key: madeira-native-${{ steps.source.outputs.sha }}-xcode16.4
+
+      - name: Build Wine ARM64EC/ARM64 PE tree
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+
+          if [ ! -f wine/build-arm64ec/Makefile ]; then
+            rm -rf wine/build-arm64ec
+            mkdir -p wine/build-arm64ec
+            cd wine/build-arm64ec
+
+            ../configure \
+              --enable-archs=arm64ec,aarch64 \
+              --without-x \
+              --without-freetype
+          fi
+          make -j"$(sysctl -n hw.ncpu)" dlls/ntdll
+
+      - name: Generate required Wine headers
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+
+          WINE_SRC="$GITHUB_WORKSPACE/wine"
+          WINE_WINDOWS="$WINE_SRC/include/wine/windows"
+          WIDL="$(command -v arm64ec-w64-mingw32-widl)"
+
+          test -x "$WIDL"
+
+          mkdir -p "$WINE_WINDOWS"
+          echo "Using widl: $WIDL"
+          echo "Wine source: $WINE_SRC"
+          echo "Wine Windows headers: $WINE_WINDOWS"
+
+          generated=0
+
+          for idl in "$WINE_SRC"/include/*.idl; do
+            [ -f "$idl" ] || continue
+
+            name="$(basename "$idl" .idl)"
+            output="$WINE_WINDOWS/${name}.h"
+
+            echo "Generating $output from $idl"
+            if "$WIDL" \
+              -I"$WINE_SRC/include" \
+              -I"$WINE_WINDOWS" \
+              -h \
+              -o "$output" \
+              "$idl"; then
+              generated=$((generated + 1))
+            else
+              echo "WARNING: widl failed for $idl"
+              rm -f "$output"
+            fi
+          done
+
+          echo "Generated $generated Wine headers."
+          echo "=== Required Wine headers ==="
+          find "$WINE_WINDOWS" \
+            \( -name 'dwrite.h' \
+            -o -name 'objidlbase.h' \
+            -o -name 'unknwn.h' \) \
+            -print
+
+          test -s "$WINE_WINDOWS/dwrite.h"
+          test -s "$WINE_WINDOWS/objidlbase.h"
+          test -s "$WINE_WINDOWS/unknwn.h"
+
+          echo "Required Wine headers are present."
+
+      - name: Clone Freetype source
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+
+          if [ ! -d research/freetype ]; then
+            mkdir -p research
+
+            git clone --depth 1 --branch VER-2-13-3 \
+              https://github.com/freetype/freetype.git \
+              research/freetype
+          fi
+
+      - name: Build GnuTLS
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          bash build/gnutls-ios/build.sh
+
+      - name: Build FreeType
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          bash build/freetype-ios/build.sh
+
+      - name: Build ntdll-unix
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          bash build/ntdll-unix/build.sh
+
+      - name: Build win32u-unix
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          bash build/win32u-unix/build.sh
+
+      - name: Build native Wine server base archive
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          WINE_SRC="$GITHUB_WORKSPACE/wine"
+          BUILD_DIR="$WINE_SRC/build-macos"
+          APP_LIB="$GITHUB_WORKSPACE/app/Madeira/libwineserver.a"
+
+          if [ ! -f "$BUILD_DIR/Makefile" ]; then
+            rm -rf "$BUILD_DIR"
+            mkdir -p "$BUILD_DIR"
+            cd "$BUILD_DIR"
+
+            "$WINE_SRC/configure" \
+              --without-x \
+              --without-freetype \
+              CFLAGS="-arch arm64" \
+              LDFLAGS="-arch arm64"
+          fi
+          cd "$BUILD_DIR"
+
+          make -j"$(sysctl -n hw.ncpu)" server/wineserver
+
+          echo "=== Native Wine server objects ==="
+          find server -maxdepth 1 -type f -name '*.o' -print | sort
+
+          test -n "$(find server -maxdepth 1 -type f -name '*.o' -print -quit)"
+
+          mkdir -p "$(dirname "$APP_LIB")"
+
+          rm -f "$APP_LIB"
+
+          /usr/bin/ar rcs "$APP_LIB" server/*.o
+
+          test -s "$APP_LIB"
+          echo "=== Base libwineserver.a ==="
+          file "$APP_LIB"
+          ls -lh "$APP_LIB"
+          /usr/bin/ar -t "$APP_LIB" | sort
+
+      - name: Build wineserver
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          bash build/wineserver/build.sh
+
+      - name: Patch FEX for iOS host compatibility
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          FEX_FILE="$GITHUB_WORKSPACE/FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp"
+          LINKER_GC_FILE="$GITHUB_WORKSPACE/FEX/Data/CMake/LinkerGC.cmake"
+
+          test -f "$FEX_FILE"
+          test -f "$LINKER_GC_FILE"
+
+          python3 - "$FEX_FILE" "$LINKER_GC_FILE" <<'PY'
+          import sys
+          from pathlib import Path
+
+          fex_path = Path(sys.argv[1])
+          linker_gc_path = Path(sys.argv[2])
+
+          text = fex_path.read_text()
+          old = """  MEMORY_BASIC_INFORMATION mbi {};
+            const char* type = "?";
+            if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {
+              type = mbi.Type == MEM_IMAGE ? "MEM_IMAGE" : mbi.Type == MEM_MAPPED ? "MEM_MAPPED" : "MEM_PRIVATE";
+            }
+            LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "
+                              "crosses16B={} | region base={} size={:#x} prot={:#x} type={} state={:#x}",
+                              Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
+                              (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,
+                              mbi.Protect, type, mbi.State);"""
+          new = """#ifdef FEX_IOS_HOST
+            LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "
+                              "crosses16B={}",
+                              Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
+                              (GPRs[AddressReg] & 15) ? "yes" : "no");
+          #else
+            MEMORY_BASIC_INFORMATION mbi {};
+            const char* type = "?";
+            if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {
+              type = mbi.Type == MEM_IMAGE ? "MEM_IMAGE" : mbi.Type == MEM_MAPPED ? "MEM_MAPPED" : "MEM_PRIVATE";
+            }
+            LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "
+                              "crosses16B={} | region base={} size={:#x} prot={:#x} type={} state={:#x}",
+                              Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
+                              (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,
+                              mbi.Protect, type, mbi.State);
+          #endif"""
+          if old not in text:
+              raise SystemExit(
+                  "ERROR: expected FEX Arm64.cpp block was not found; refusing to patch."
+              )
+
+          fex_path.write_text(text.replace(old, new, 1))
+
+          linker_text = linker_gc_path.read_text()
+          old_linker = """macro(LinkerGC target)
+            if (CMAKE_BUILD_TYPE MATCHES "RELEASE")
+              target_link_options(${target} PRIVATE
+                "LINKER:--gc-sections"
+                "LINKER:--strip-all"
+                "LINKER:--as-needed")
+            endif()
+          endmacro()"""
+          new_linker = """macro(LinkerGC target)
+            if (CMAKE_BUILD_TYPE MATCHES "RELEASE" AND NOT APPLE)
+              target_link_options(${target} PRIVATE
+                "LINKER:--gc-sections"
+                "LINKER:--strip-all"
+                "LINKER:--as-needed")
+            endif()
+          endmacro()"""
+          if old_linker not in linker_text:
+              raise SystemExit(
+                  "ERROR: expected FEX LinkerGC.cmake block was not found; refusing to patch."
+              )
+
+          linker_gc_path.write_text(linker_text.replace(old_linker, new_linker, 1))
+
+          PY
+
+          echo "=== FEX iOS Arm64.cpp patch ==="
+          grep -n -A24 -B4 'MISALIGNED-UNSUPPORTED' "$FEX_FILE"
+
+          echo "=== FEX LinkerGC.cmake patch ==="
+          cat "$LINKER_GC_FILE"
+
+      - name: Build FEX for iOS
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          cmake -S FEX -B FEX/build-ios -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-DFEX_IOS_HOST=1" \
+            -DCMAKE_CXX_FLAGS="-DFEX_IOS_HOST=1" \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_FEX_LINUX_TESTS=OFF \
+            -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF \
+            -DBUILD_STEAM_SUPPORT=OFF \
+            -DENABLE_LTO=OFF \
+            -DENABLE_CCACHE=OFF \
+            -DTUNE_CPU=generic \
+            -DTUNE_ARCH=generic 2>&1 | tee fex-configure.log
+          set +e
+          cmake --build FEX/build-ios --parallel "$(sysctl -n hw.ncpu)" -- -k 0 2>&1 | tee fex-build.log
+          set -e
+
+          # Only the standalone dylib is allowed to fail
+          if grep '^FAILED:' fex-build.log | grep -qv 'libFEXCore\.dylib'; then
+            echo "Unexpected FEX build failure"
+            exit 1
+          fi
+          test -s FEX/build-ios/FEXCore/Source/libFEXCore.a
+
+      - name: Upload FEX logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fex-logs
+          path: |
+            fex-configure.log
+            fex-build.log
+          if-no-files-found: ignore
+
+      - name: Restore LLVM 15 (iOS) cache
+        id: llvm-ios-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/llvm-project
+            toolchains/llvm-ios-build
+          key: madeira-llvm15.0.7-ios18-v1
+
+      - name: Build LLVM 15 for iOS
+        if: steps.llvm-ios-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          JOBS="$(sysctl -n hw.ncpu)"
+          SRC="$PWD/toolchains/llvm-project"
+          HOST="$PWD/toolchains/llvm-host-build"
+          IOS="$PWD/toolchains/llvm-ios-build"
+
+          if [ ! -d "$SRC/.git" ]; then
+            git clone --depth 1 --branch llvmorg-15.0.7 \
+              https://github.com/llvm/llvm-project.git "$SRC"
+          fi
+
+          # Apple ld rejects --gc-sections; exclude iOS from LLVM's
+          # non-Darwin --gc-sections branch, and make LLVM's symbol-export
+          # handling recognize iOS as Darwin/Apple.
+          python3 - "$SRC/llvm/cmake/modules/AddLLVM.cmake" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+
+          # iOS must not use the non-Darwin --gc-sections branch.
+          old_gc = 'elseif(NOT MSVC AND NOT CMAKE_SYSTEM_NAME MATCHES "AIX|OS390")'
+          new_gc = 'elseif(NOT MSVC AND NOT CMAKE_SYSTEM_NAME MATCHES "AIX|OS390|iOS")'
+
+          if old_gc in text:
+              text = text.replace(old_gc, new_gc, 1)
+              print("Patched LLVM 15.0.7 --gc-sections condition for iOS.")
+          elif new_gc in text:
+              print("LLVM iOS --gc-sections patch already present.")
+          else:
+              raise SystemExit(
+                  "ERROR: expected LLVM 15.0.7 --gc-sections condition was not found; refusing to patch."
+              )
+
+          # Make add_llvm_symbol_exports() treat iOS like Darwin.
+          marker = "function(add_llvm_symbol_exports target_name export_file)"
+          start = text.find(marker)
+
+          if start == -1:
+              raise SystemExit(
+                  "ERROR: add_llvm_symbol_exports() was not found; refusing to patch."
+              )
+
+          end_marker = "endfunction(add_llvm_symbol_exports)"
+          end = text.find(end_marker, start)
+
+          if end == -1:
+              raise SystemExit(
+                  "ERROR: end of add_llvm_symbol_exports() was not found; refusing to patch."
+              )
+
+          block = text[start:end]
+
+          old_symbols = 'if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")'
+          new_symbols = 'if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin|iOS")'
+
+          if old_symbols in block:
+              block = block.replace(old_symbols, new_symbols, 1)
+              text = text[:start] + block + text[end:]
+              print("Patched LLVM 15.0.7 symbol exports for iOS.")
+          elif new_symbols in block:
+              print("LLVM iOS symbol-export patch already present.")
+          else:
+              raise SystemExit(
+                  "ERROR: expected Darwin symbol-export condition was not found "
+                  "inside add_llvm_symbol_exports(); refusing to patch."
+              )
+
+          path.write_text(text)
+          PY
+
+          cmake -S "$SRC/llvm" -B "$HOST" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF
+
+          cmake --build "$HOST" --target llvm-tblgen --parallel "$JOBS"
+
+          cmake -S "$SRC/llvm" -B "$IOS" -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TABLEGEN="$HOST/bin/llvm-tblgen" \
+            -DLLVM_BUILD_UTILS=OFF \
+            -DLLVM_BUILD_TOOLS=OFF \
+            -DLLVM_INCLUDE_TOOLS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_TARGETS_TO_BUILD=""
+
+          cmake --build "$IOS" --parallel "$JOBS"
+
+          ls "$IOS"/lib/libLLVM*.a
+          find "$IOS" -name '*.o' -delete
+
+          cmake -S "$SRC/llvm" -B "$HOST" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF
+
+          cmake --build "$HOST" --target llvm-tblgen --parallel "$JOBS"
+
+          cmake -S "$SRC/llvm" -B "$IOS" -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TABLEGEN="$HOST/bin/llvm-tblgen" \
+            -DLLVM_BUILD_UTILS=OFF \
+            -DLLVM_BUILD_TOOLS=OFF \
+            -DLLVM_INCLUDE_TOOLS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_TARGETS_TO_BUILD=""
+
+          cmake --build "$IOS" --parallel "$JOBS"
+
+          ls "$IOS"/lib/libLLVM*.a
+          find "$IOS" -name '*.o' -delete
+
+      - name: Save LLVM 15 (iOS) cache
+        if: steps.llvm-ios-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/llvm-project
+            toolchains/llvm-ios-build
+          key: madeira-llvm15.0.7-ios18-v1
+
+      - name: Build DXMT for iOS
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          xcodebuild -downloadComponent MetalToolchain >/dev/null 2>&1 || true
+
+          # Metal shader headers that airconv includes
+          OUT=build/dxmt-ios/shader-headers
+          mkdir -p "$OUT"
+          for name in air_msad air_samplepos air_tessellation; do
+            xcrun -sdk macosx metal -o "$OUT/$name.air" \
+              -c "research/dxmt/src/airconv/shaders/$name.metal" \
+              -std=metal3.1 --target=air64-apple-macos14.0
+            xxd -n "$name" -i "$OUT/$name.air" "$OUT/$name.h"
+          done
+
+          if ! bash build/dxmt-ios/build.sh; then
+            for f in build/dxmt-ios/obj/*.err; do
+              echo "=== $f"
+              head -20 "$f"
+            done
+            exit 1
+          fi
+
+          # Combine DXMT objects + LLVM libs into the archive the app links
+          shopt -s nullglob
+          objs=(build/dxmt-ios/obj/*.o)
+          llvm_libs=(toolchains/llvm-ios-build/lib/*.a)
+
+          (( ${#objs[@]} > 0 )) || { echo "No DXMT objects"; exit 1; }
+          (( ${#llvm_libs[@]} > 0 )) || { echo "No LLVM libs"; exit 1; }
+
+          xcrun -sdk iphoneos libtool -static \
+            -o build/dxmt-ios/libdxmt_combined.a "${objs[@]}" "${llvm_libs[@]}"
+
+          cp build/dxmt-ios/libdxmt_combined.a app/Madeira/libdxmt_combined.a
+
+      - name: Rebuild wineserver archive for iOS
+        run: |
+          set -euxo pipefail
+
+          WINE_SRC="$GITHUB_WORKSPACE/wine"
+          WS="$GITHUB_WORKSPACE/build/wineserver"
+          SHIMS="$GITHUB_WORKSPACE/build/ntdll-unix/shims"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          BASE="$WS/obj/ios-base"
+          APP_LIB="$GITHUB_WORKSPACE/app/Madeira/libwineserver.a"
+
+          test -f "$WINE_SRC/build-macos/include/config.h"
+          for f in config_ios.h unicode_fix.h wineserver_ios_kill.h; do
+            test -f "$WS/$f"
+          done
+
+          rm -rf "$BASE" "$APP_LIB" "$WS/obj/libwineserver.a"
+          mkdir -p "$BASE"
+
+          # sources that build.sh replaces with its own iOS versions
+          SKIP=" async.c class.c fd.c mach.c main.c mapping.c object.c process.c queue.c region.c request.c sock.c thread.c unicode.c user.c window.c winstation.c "
+
+          FLAGS=(
+            -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 -O2
+            -I"$WINE_SRC/include" -I"$WINE_SRC/include/wine"
+            -I"$WINE_SRC/build-macos/include" -I"$WINE_SRC/build-macos/server"
+            -I"$WS" -I"$WINE_SRC/server" -I"$SHIMS"
+            -include "$WS/config_ios.h" -include stdarg.h
+            -include "$WS/unicode_fix.h" -include "$WS/wineserver_ios_kill.h"
+            -DBINDIR=\"/usr/local/bin\" -DDATADIR=\"/usr/local/share\"
+            -D__WINESRC__ -DWINE_IOS=1 -Dmain=wineserver_main
+            -Wno-implicit-function-declaration
+          )
+
+          objs=()
+          while IFS= read -r src; do
+            case "$SKIP" in *" $src "*) continue ;; esac
+            xcrun -sdk iphoneos clang "${FLAGS[@]}" -c "$WINE_SRC/server/$src" -o "$BASE/${src%.c}.o"
+            objs+=("$BASE/${src%.c}.o")
+          done < <(awk '
+            /^SOURCES[[:space:]]*=/ { on = 1; sub(/^SOURCES[[:space:]]*=/, "") }
+            on {
+              cont = ($0 ~ /\\[[:space:]]*$/)
+              gsub(/\\/, "")
+              for (i = 1; i <= NF; i++) if ($i ~ /\.c$/) print $i
+              if (!cont) exit
+            }' "$WINE_SRC/server/Makefile.in")
+
+          (( ${#objs[@]} > 0 ))
+          /usr/bin/ar rcs "$WS/obj/libwineserver.a" "${objs[@]}"
+          cp "$WS/obj/libwineserver.a" "$APP_LIB"
+
+          bash build/wineserver/build.sh
+
+      - name: Save native build cache
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            FEX/build-ios
+            wine/build-arm64ec
+            wine/build-macos
+            build/gnutls-ios/obj
+            build/freetype-ios/obj
+            build/ntdll-unix/obj
+            build/win32u-unix/obj
+            build/wineserver/obj
+            build/dxmt-ios/obj
+            build/dxmt-ios/shader-headers
+            build/dxmt-ios/libdxmt_unix.a
+            build/dxmt-ios/libdxmt_combined.a
+            app/Madeira/libntdll_unix.a
+            app/Madeira/libwin32u_unix.a
+            app/Madeira/libwineserver.a
+            app/Madeira/libdxmt_combined.a
+          key: madeira-native-${{ steps.source.outputs.sha }}-xcode16.4
+
+      - name: Supply VC++ runtime folder
+        run: bash tools/fetch-vcruntime.sh
+
+      - name: Verify required native libraries
+        run: |
+          set -euxo pipefail
+
+          required=(
+            app/Madeira/libntdll_unix.a
+            app/Madeira/libwin32u_unix.a
+            app/Madeira/libwineserver.a
+            app/Madeira/libdxmt_combined.a
+          )
+
+          for f in "${required[@]}"; do
+            test -s "$f" || {
+              echo "Missing/empty: $f"
+              exit 1
+            }
+            file "$f"
+          done
+      
+      - name: Check native libraries are iOS builds
+        run: |
+          set -euo pipefail
+          bad=0
+          for lib in app/Madeira/*.a; do
+            hits="$(xcrun otool -l "$lib" | awk '
+              /^[^ ].*:$/ { member = $0 }
+              /platform (MACOS|1)[[:space:]]*$/ || /LC_VERSION_MIN_MACOSX/ { print member }
+            ' | sort -u)"
+            if [ -n "$hits" ]; then
+              echo "macOS-built objects in $lib:"
+              echo "$hits" | head -20
+              bad=1
+            else
+              echo "OK $lib"
+            fi
+          done
+          exit "$bad"
+
+      - name: Select Xcode 26 for the app build
+        run: |
+          set -euxo pipefail
+          ls -d /Applications/Xcode_26*.app
+          XCODE="$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos
+          xcodebuild -downloadComponent MetalToolchain >/dev/null 2>&1 || true
+
+      - name: Show Xcode project targets
+        run: |
+          set -euxo pipefail
+
+          xcodebuild \
+            -project app/Madeira.xcodeproj \
+            -list
+
+      - name: Lower JIT pool to 384 MB
+        run: |
+          set -euxo pipefail
+          perl -pi -e 's/var poolSizeMB = 896\b/var poolSizeMB = 384/' app/Madeira/ContentView.swift
+          grep -n 'var poolSizeMB' app/Madeira/ContentView.swift
+          grep -q 'var poolSizeMB = 384' app/Madeira/ContentView.swift
+
+      - name: Build Madeira app (unsigned)
+        run: |
+          set -euxo pipefail
+
+          rm -rf derived
+          xcodebuild \
+            -project app/Madeira.xcodeproj \
+            -scheme Madeira \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath derived \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            PRODUCT_BUNDLE_IDENTIFIER="${BUNDLE_ID}" \
+            IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}"
+
+      - name: Locate and validate Madeira.app
+        run: |
+          set -euxo pipefail
+
+          APP_PATH="$(find derived/Build/Products -maxdepth 3 -type d -name Madeira.app -print -quit)"
+
+          test -n "$APP_PATH"
+          test -f "$APP_PATH/Info.plist"
+          test -f "$APP_PATH/Madeira"
+
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+
+          echo "Built app: $APP_PATH"
+          file "$APP_PATH/Madeira"
+
+      - name: Package IPA (ad-hoc signed with entitlements)
+        run: |
+          set -euxo pipefail
+
+          rm -rf Payload Madeira.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/Madeira.app
+
+          find app -name '*.entitlements' -print
+          ENT="$(grep -rl 'increased-memory-limit' app --include='*.entitlements' | head -1 || true)"
+          [ -n "$ENT" ] || ENT="$(find app -name '*.entitlements' | head -1)"
+          test -n "$ENT"
+          echo "Using entitlements: $ENT"
+          cat "$ENT"
+
+          codesign --force --deep --sign - --timestamp=none \
+            --entitlements "$ENT" Payload/Madeira.app
+          codesign -d --entitlements :- Payload/Madeira.app
+
+          /usr/bin/zip -qry Madeira.ipa Payload
+          rm -rf Payload
+
+          test -s Madeira.ipa
+          ls -lh Madeira.ipa
+          shasum -a 256 Madeira.ipa | tee Madeira.ipa.sha256
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-unsigned
+          path: |
+            Madeira.ipa
+            Madeira.ipa.sha256
+          retention-days: 14
+
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "# Madeira IPA build"
+            echo
+            echo "**Commit:** \`${GITHUB_SHA}\`"
+            echo "**Xcode:**"
+            xcodebuild -version | head -2
+            echo
+            if [ -f Madeira.ipa ]; then
+              echo "**IPA:** generated"
+              echo "**SHA-256:** \`$(shasum -a 256 Madeira.ipa | awk '{print $1}')\`"
+              echo "**Size:** $(du -h Madeira.ipa | awk '{print $1}')"
+            else
+              echo "**IPA:** not generated"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
