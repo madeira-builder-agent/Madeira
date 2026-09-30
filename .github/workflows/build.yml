@@ -113,7 +113,7 @@ jobs:
           key: madeira-native-${{ steps.source.outputs.sha }}-xcode16.4
 
       - name: Build Wine ARM64EC/ARM64 PE tree
-        if: steps.native-cache.outputs.cache-hit != 'true'
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
 
@@ -130,7 +130,7 @@ jobs:
           make -j"$(sysctl -n hw.ncpu)" dlls/ntdll
 
       - name: Generate required Wine headers
-        if: steps.native-cache.outputs.cache-hit != 'true'
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
 
@@ -182,7 +182,7 @@ jobs:
           echo "Required Wine headers are present."
 
       - name: Clone Freetype source
-        if: steps.native-cache.outputs.cache-hit != 'true'
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
 
@@ -195,37 +195,37 @@ jobs:
           fi
 
       - name: Build GnuTLS
-        if: steps.native-cache.outputs.cache-hit != 'true'
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           bash build/gnutls-ios/build.sh
 
       - name: Build FreeType
-        if: steps.native-cache.outputs.cache-hit != 'true'
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           bash build/freetype-ios/build.sh
 
       - name: Build FFmpeg
-        if: steps.native-cache.outputs.cache-hit != 'true'
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           bash build/ffmpeg/build.sh
 
       - name: Build ntdll-unix
-        if: steps.native-cache.outputs.cache-hit != 'true'
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           bash build/ntdll-unix/build.sh
 
       - name: Build win32u-unix
-        if: steps.native-cache.outputs.cache-hit != 'true'
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           bash build/win32u-unix/build.sh
 
       - name: Build native Wine server base archive
-        if: steps.native-cache.outputs.cache-hit != 'true'
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           WINE_SRC="$GITHUB_WORKSPACE/wine"
@@ -265,13 +265,13 @@ jobs:
           /usr/bin/ar -t "$APP_LIB" | sort
 
       - name: Build wineserver
-        if: steps.native-cache.outputs.cache-hit != 'true'
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           bash build/wineserver/build.sh
 
       - name: Patch FEX for iOS host compatibility
-        if: steps.native-cache.outputs.cache-hit != 'true'
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           FEX_FILE="$GITHUB_WORKSPACE/FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp"
@@ -355,7 +355,7 @@ jobs:
           cat "$LINKER_GC_FILE"
 
       - name: Build FEX for iOS
-        if: steps.native-cache.outputs.cache-hit != 'true'
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           cmake -S FEX -B FEX/build-ios -G Ninja \
@@ -407,7 +407,7 @@ jobs:
           key: madeira-llvm15.0.7-ios18-v1
 
       - name: Build LLVM 15 for iOS
-        if: steps.llvm-ios-cache.outputs.cache-hit != 'true'
+        if: always() && steps.llvm-ios-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           JOBS="$(sysctl -n hw.ncpu)"
@@ -546,7 +546,7 @@ jobs:
           find "$IOS" -name '*.o' -delete
 
       - name: Save LLVM 15 (iOS) cache
-        if: steps.llvm-ios-cache.outputs.cache-hit != 'true'
+        if: always() && steps.llvm-ios-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -555,7 +555,7 @@ jobs:
           key: madeira-llvm15.0.7-ios18-v1
 
       - name: Build DXMT for iOS
-        if: steps.native-cache.outputs.cache-hit != 'true'
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           xcodebuild -downloadComponent MetalToolchain >/dev/null 2>&1 || true
@@ -646,7 +646,7 @@ jobs:
           bash build/wineserver/build.sh
 
       - name: Save native build cache
-        if: steps.native-cache.outputs.cache-hit != 'true'
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -736,9 +736,9 @@ jobs:
       - name: Lower JIT pool to 384 MB
         run: |
           set -euxo pipefail
-          perl -pi -e 's/var poolSizeMB = 896\b/var poolSizeMB = 384/' app/Madeira/ContentView.swift
-          grep -n 'var poolSizeMB' app/Madeira/ContentView.swift
-          grep -q 'var poolSizeMB = 384' app/Madeira/ContentView.swift
+          perl -pi -e 's/sessionPoolMB\(standard: 896\b/sessionPoolMB(standard: 384/' app/Madeira/ContentView.swift
+          grep -n 'sessionPoolMB(standard:' app/Madeira/ContentView.swift
+          grep -q 'sessionPoolMB(standard: 384' app/Madeira/ContentView.swift
 
       - name: Build Madeira app (unsigned)
         run: |
