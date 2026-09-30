@@ -148,11 +148,13 @@ compile_unixlib "$BUILD_DIR/dnsapi_unixlib_ios.c" "dnsapi_unixlib" "dnsapi" \
 # with libavcodec, and the wg_parser (quartz's MP3/WAV splitters, Media
 # Foundation's MP4 source; wg_parser_av_ios.c, #included by it) with
 # libavformat.  FFmpeg comes from build/ffmpeg/build.sh (LGPL configuration).
-# The widl-generated mfobjects.h/mftransform.h that unixlib.h pulls in only
-# exist in a configured build tree's include dir, which $WINE_BUILD already is.
+# The widl-generated wtypes.h/mfobjects.h/mftransform.h that unixlib.h pulls
+# in are produced by the "Generate required Wine headers" workflow step into
+# wine/include/wine/windows, so that dir is on the include path here.
 FFMPEG_PREFIX="$REPO_ROOT/toolchains/ffmpeg-ios"
 compile_unixlib "$BUILD_DIR/winegstreamer_unixlib_ios.c" "winegstreamer_unixlib" "winegstreamer" \
-    -I"$WINE_SRC/dlls/winegstreamer" -I"$FFMPEG_PREFIX/include"
+    -I"$WINE_SRC/dlls/winegstreamer" -I"$FFMPEG_PREFIX/include" \
+    -I"$WINE_SRC/include/wine/windows"
 # MADEIRA ml1990: the wg_parser's H.264/HEVC (VideoToolbox) and AAC
 # (AudioToolbox) decoders.  Its own translation unit with NO Wine header --
 # CoreFoundation and winnt.h disagree about several names -- so it is compiled
