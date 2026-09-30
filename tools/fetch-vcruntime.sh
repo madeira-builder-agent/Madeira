@@ -1,92 +1,55 @@
-#!/bin/bash
-# Fetch Microsoft Visual C++ runtime DLLs for bundling with Madeira.
-# Downloads VC_redist.x64.exe from Microsoft, extracts the 12 required DLLs,
-# and places them in app/Madeira/x86_64-vcruntime/.
-# These are Microsoft binaries, not redistributable under this project's license,
-# so they are fetched at build time, not committed.
-set -euxo pipefail
+#!/usr/bin/env bash
+set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DEST="$REPO_ROOT/app/Madeira/x86_64-vcruntime"
+DEST="${GITHUB_WORKSPACE:-$PWD}/app/Madeira/x86_64-vcruntime"
+INV="${GITHUB_WORKSPACE:-$PWD}/vcruntime-inventory.txt"
+WORK="${RUNNER_TEMP:-/tmp}/vcredist"
+NEEDED="concrt140 msvcp140 msvcp140_1 msvcp140_2 msvcp140_atomic_wait msvcp140_codecvt_ids vcamp140 vccorlib140 vcomp140 vcruntime140 vcruntime140_1"
+CORE="concrt140 msvcp140 vcruntime140 vcruntime140_1"
 
-DLLS=(
-  concrt140.dll
-  msvcp140.dll
-  msvcp140_1.dll
-  msvcp140_2.dll
-  msvcp140_atomic_wait.dll
-  msvcp140_codecvt_ids.dll
-  vcamp140.dll
-  vccorlib140.dll
-  vcomp140.dll
-  vcruntime140.dll
-  vcruntime140_1.dll
-  vcruntime140_threads.dll
-)
+command -v cabextract >/dev/null || brew install cabextract
 
-mkdir -p "$DEST"
+rm -rf "$WORK"
+mkdir -p "$WORK/L0" "$WORK/L1" "$WORK/L2" "$DEST"
+cd "$WORK"
 
-# Skip if all DLLs already present and non-empty
-all_present=true
-for dll in "${DLLS[@]}"; do
-  if [ ! -s "$DEST/$dll" ]; then
-    all_present=false
-    break
-  fi
-done
-if $all_present; then
-  echo "All VC++ runtime DLLs already present in $DEST"
-  exit 0
-fi
+curl -fL https://aka.ms/vs/17/release/vc_redist.x64.exe -o vc_redist.x64.exe
+shasum -a 256 vc_redist.x64.exe
 
-# Ensure 7-Zip is available
-if ! command -v 7zz >/dev/null 2>&1; then
-  echo "Installing 7-Zip..."
-  brew install sevenzip
-fi
+cabextract -q -L -d L0 vc_redist.x64.exe || true
+[ -n "$(ls -A L0)" ] || { echo "ERROR: nothing extracted from installer"; exit 1; }
 
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+pass() {
+  find "$1" -type f ! -iname '*.dll' | while IFS= read -r f; do
+    d="$2/${f#$1/}.d"
+    mkdir -p "$d"
+    cabextract -q -L -d "$d" "$f" >/dev/null 2>&1 || rmdir "$d" 2>/dev/null || true
+  done
+}
+pass L0 L1
+pass L1 L2
 
-# Download from Microsoft's stable link
-echo "Downloading VC_redist.x64.exe from Microsoft..."
-curl -sL --max-time 300 -o "$TMPDIR/VC_redist.x64.exe" "https://aka.ms/vs/17/release/vc_redist.x64.exe"
-test -s "$TMPDIR/VC_redist.x64.exe"
+find L0 L1 L2 -type f | sort > "$INV"
+echo "=== extracted files (first 120) ==="
+head -120 "$INV"
 
-# Extract the exe, then extract CABs inside
-echo "Extracting..."
-7zz x "$TMPDIR/VC_redist.x64.exe" -o"$TMPDIR/vcredist" -y >/dev/null
-# Find and extract all CAB files (layout varies by version)
-find "$TMPDIR/vcredist" -iname "*.cab" -exec 7zz x {} -o"$TMPDIR/cabs" -y \; >/dev/null
+missing_core=""
+for name in $NEEDED; do
+  best=""; best_size=0
+  while IFS= read -r f; do
+    file "$f" | grep -q 'x86-64' || continue
+    size="$(wc -c < "$f" | tr -d ' ')"
+    if [ "$size" -gt "$best_size" ]; then best="$f"; best_size="$size"; fi
+  done < <(find L0 L1 L2 -type f -iname "${name}.dll*" 2>/dev/null)
 
-# Copy the 12 DLLs (case-insensitive match)
-found=0
-for dll in "${DLLS[@]}"; do
-  src=$(find "$TMPDIR/cabs" "$TMPDIR/vcredist" -iname "$dll" -type f 2>/dev/null | head -1)
-  if [ -n "$src" ]; then
-    cp "$src" "$DEST/$dll"
-    found=$((found + 1))
-    echo "  $dll"
+  if [ -n "$best" ]; then
+    cp "$best" "$DEST/${name}.dll"
+    echo "OK  ${name}.dll <- $best"
   else
-    echo "WARNING: $dll not found in extracted files"
+    echo "MISSING ${name}.dll"
+    case " $CORE " in *" $name "*) missing_core="$missing_core $name" ;; esac
   fi
 done
 
-echo "Found $found/${#DLLS[@]} DLLs"
-
-# Verify all present
-missing=0
-for dll in "${DLLS[@]}"; do
-  if [ ! -s "$DEST/$dll" ]; then
-    echo "ERROR: Missing $dll"
-    missing=$((missing + 1))
-  fi
-done
-
-if [ $missing -gt 0 ]; then
-  echo "ERROR: $missing DLLs missing"
-  exit 1
-fi
-
-echo "All VC++ runtime DLLs ready in $DEST"
+ls -l "$DEST"
+[ -z "$missing_core" ] || { echo "ERROR: missing required:$missing_core"; exit 1; }
