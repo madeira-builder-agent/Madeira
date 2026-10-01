@@ -740,6 +740,11 @@ jobs:
           grep -n 'sessionPoolMB(standard:' app/Madeira/ContentView.swift
           grep -q 'sessionPoolMB(standard: 384' app/Madeira/ContentView.swift
 
+      - name: Stage license files
+        run: |
+          set -euxo pipefail
+          bash build/stage-licenses.sh
+
       - name: Build Madeira app (unsigned)
         run: |
           set -euxo pipefail
